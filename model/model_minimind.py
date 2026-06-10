@@ -5,15 +5,70 @@ from transformers.activations import ACT2FN
 from transformers import PreTrainedModel, GenerationMixin, PretrainedConfig
 from transformers.modeling_outputs import MoeCausalLMOutputWithPast
 
-# Manifold-Constrained Hyper-Connections (mHC, DeepSeek 2025, arXiv:2512.24880)：
-# 把 n 路并行残差流通过 doubly-stochastic 矩阵（Birkhoff polytope 上的 Sinkhorn-Knopp 投影）混合，
-# 解决 HC 长程信号无界放大问题。每个 sublayer F 由 MHCConnection 包裹（论文 Eq.3）。
-# 本实现参考并对齐 DeepSeek 官方 TileKernels (deepseek-ai/TileKernels) PyTorch reference，
-# 关键优化：fused φ Linear (3→1 GEMM)、共享 α/bias、softmax 起步的 Sinkhorn。
-# entry/exit：
-#   - StreamExpand : 对称复制 n 份（无参数，对齐官方 expand_to_mhc_ref）
-#   - MHCHead      : 可学加权 reduce（对齐官方 mhc_head，解决"最后一层 H_res frozen"死锁）
-from .mhc import MHCConnection, StreamExpand, MHCHead
+# Manifold-Constrained Hyper-Connections (mHC, DeepSeek 2025, arXiv:2512.24880)。
+# use_mhc=1 → MHCConnection_Fused（完整 mHC，含 H^res Sinkhorn-Knopp 投影）
+# use_mhc=2 → MHCConnection_FusedNoHres（H^res = I_n，跳过 SK）
+from .mhc_common import StreamExpand, MHCHead
+from .mhc_fused import MHCConnection_Fused
+from .mhc_fused_no_hres import MHCConnection_FusedNoHres
+
+# Optional Dao-AILab flash-attn 库（CUDA-only，比 PyTorch SDPA 更快、显存更省）。
+# 未安装时自动回退到 SDPA / 慢路径，不影响功能。
+# H800/H100 强烈推荐 flash-attn ≥ 3.0（专为 Hopper 优化 WGMMA + TMA，比 v2 快约 1.5-2x）；
+# rank 0 进程会打印 1 次版本日志，便于训练脚本启动时确认是否启用 Hopper 优化路径。
+try:
+    from flash_attn import flash_attn_func as _flash_attn_func   # type: ignore
+    _FLASH_ATTN_LIB_AVAILABLE = True
+    try:
+        import flash_attn as _flash_attn_module                  # type: ignore
+        _FLASH_ATTN_VERSION = getattr(_flash_attn_module, "__version__", "unknown")
+    except Exception:
+        _FLASH_ATTN_VERSION = "unknown"
+except Exception:
+    _flash_attn_func = None
+    _FLASH_ATTN_LIB_AVAILABLE = False
+    _FLASH_ATTN_VERSION = None
+
+
+def _log_flash_attn_status_once():
+    """在 rank 0（或非分布式）首次构建模型时打印一次 flash-attn 状态。
+    H800 上未装 v3+ 会有显著性能损失，便于训练时立刻发现配置问题。"""
+    if getattr(_log_flash_attn_status_once, "_done", False):
+        return
+    _log_flash_attn_status_once._done = True
+    # 仅 rank 0 打印（无分布式环境时也打）
+    try:
+        import torch.distributed as dist
+        if dist.is_available() and dist.is_initialized() and dist.get_rank() != 0:
+            return
+    except Exception:
+        pass
+    if not _FLASH_ATTN_LIB_AVAILABLE:
+        print("[mHC/attn] flash-attn lib 未安装 → 走 PyTorch SDPA。"
+              " H800/H100 建议 `pip install flash-attn>=3.0` 启用 Hopper 优化路径。")
+        return
+    v = str(_FLASH_ATTN_VERSION)
+    try:
+        major = int(v.split(".")[0])
+    except Exception:
+        major = -1
+    if major >= 3:
+        print(f"[mHC/attn] flash-attn v{v} 已启用（Hopper 优化：WGMMA + TMA）")
+    elif major >= 0:
+        # H800 上 v2 也能跑，但比 v3 慢 1.5-2x；提示用户升级
+        try:
+            import torch
+            cap = torch.cuda.get_device_capability() if torch.cuda.is_available() else (0, 0)
+            cc = cap[0] * 10 + cap[1]
+        except Exception:
+            cc = 0
+        if cc >= 90:
+            print(f"[mHC/attn] flash-attn v{v} 已启用，但当前 GPU (sm_{cc}) 为 Hopper；"
+                  " 建议升级到 flash-attn>=3.0 获得 WGMMA+TMA 加速（约 1.5-2x）。")
+        else:
+            print(f"[mHC/attn] flash-attn v{v} 已启用。")
+    else:
+        print(f"[mHC/attn] flash-attn 已加载（版本未知）。")
 
 # 🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏
 #                                     MiniMind Config
@@ -21,11 +76,7 @@ from .mhc import MHCConnection, StreamExpand, MHCHead
 class MiniMindConfig(PretrainedConfig):
     model_type = "minimind"
     def __init__(self, hidden_size=1024, num_hidden_layers=24, use_moe=False,
-                 use_mhc=False, mhc_residual_expansion=4,
-                 mhc_sinkhorn_iters=10, mhc_alpha_init=0.01,
-                 mhc_post_mult_value=2.0, mhc_disable_h_res=False,
-                 mhc_per_stream_norm=False, mhc_h_pre_activation='sigmoid',
-                 mhc_sublayer_prenorm=True,
+                 use_mhc=0, mhc_residual_expansion=4,
                  **kwargs):
         super().__init__(**kwargs)
         self.hidden_size = hidden_size
@@ -61,47 +112,14 @@ class MiniMindConfig(PretrainedConfig):
         self.norm_topk_prob = kwargs.get("norm_topk_prob", True)
         self.router_aux_loss_coef = kwargs.get("router_aux_loss_coef", 5e-4)
 
-        ### ===== 残差结构配置（两种残差模式二选一互斥）=====
-        # A) plain（默认；use_mhc=0）：
-        #    标准 pre-Norm（LLaMA 风格）。残差流 = hidden_size；输出端 Identity。
-        #      h = h + attn(RMSNorm(h));  h = h + mlp(RMSNorm(h))
-        #
-        # B) mHC（use_mhc=1，arXiv:2512.24880 DeepSeek 2025）：
-        #    Manifold-Constrained Hyper-Connections。残差流加宽到 n·hidden_size（n 路），
-        #    每个 sublayer 由 MHCConnection 包裹，按论文 Eq.3 完成
-        #      x' = H^res · x + H^post.T · F(H^pre · x)
-        #    其中 H^pre/H^post 经 σ 非负，H^res 经 Sinkhorn-Knopp 投影到 Birkhoff polytope
-        #    （doubly-stochastic 矩阵），保证 ∏ H^res 长程 mass-conserving，根除 HC 失稳。
-        #    sublayer F = attn / mlp，直接接收 H^pre·x（**不再额外 pre-Norm**，对齐官方
-        #    DeepSeek TileKernels mhc_pre 实现）；MHCConnection 内部的 RMSNorm(n·D) 已
-        #    在生成 H 系数时承担归一化职责，mass-conserving 保证 sublayer 输入量级可控。
-        #    首尾用纯 reshape：embed → RMSNorm + replicate(n)；output → MHCHead → RMSNorm。
-        #
-        # mhc_residual_expansion 含义：mHC hyper-connection 路数 n。
-        #   - 残差流总维度 = hidden_size * mhc_residual_expansion
-        #   - 常用值：2 / 4 / 8（4 为默认）；越大表达力越强但 φ^res 参数按 n³C 增长较快
+        # use_mhc: 0=plain pre-Norm; 1=完整 mHC (含 H^res + SK); 2=mHC 无 H^res (H^res=I_n)
+        # mhc_residual_expansion (n): 残差流路数；总维度 = hidden_size * n
+        #   fused kernel 约束：n ∈ {1,2,4,8,16}，n·hidden_size 是 2 的幂
+        # 其他 mHC 超参（alpha_init / sinkhorn_iters / post_mult_value）固化在底层 ctor 默认值
         self.use_mhc                = use_mhc
-        self.mhc_residual_expansion     = mhc_residual_expansion
-        # mHC 超参（默认对齐 DeepSeek 官方 TileKernels：sinkhorn_iters=10, post_mult_value=2.0）
-        self.mhc_sinkhorn_iters   = mhc_sinkhorn_iters
-        self.mhc_alpha_init       = mhc_alpha_init
-        self.mhc_post_mult_value  = mhc_post_mult_value
-        # ===== mHC ablation 开关（默认值都对应论文/官方标准实现，向后兼容）=====
-        # disable_h_res:     True → H^res 冻结为 I_n，跳过 SK 投影（论文 Table 1 H^res 禁用对照）
-        # h_pre_activation:  H^pre 激活；'sigmoid'(默认/论文) | softmax | identity | relu | tanh
-        # per_stream_norm:   True → input_rms 改为 PerStreamRMSNorm(n,D)（每路独立 weight,
-        #                    参数量与默认一致，strictly controlled，验证整体 norm 必要性）
-        # sublayer_prenorm:  True(默认/论文) → sublayer F 内部含 RMSNorm，即 F(z)=sublayer(RMSNorm(z))
-        #                    论文 §3.2 明确"pre-norm Transformer 架构"，Table 3 注释"accounting
-        #                    for the pre-norm with in F"，DeepSeek TileKernels mhc_pre 把 F 当黑盒，
-        #                    pre-Norm 由调用者在 F 里加。
-        #                    False → sublayer F = 裸 attn/mlp（前版实现 / ablation 对照）。
-        #                    ⚠️ False 在 32 层 + bf16 下易出现信号爆炸 → NaN（实测 100 步内 NaN）。
-        # 详见 MHCConnection.__init__ 内的逐项说明。
-        self.mhc_disable_h_res    = mhc_disable_h_res
-        self.mhc_h_pre_activation = mhc_h_pre_activation
-        self.mhc_per_stream_norm  = mhc_per_stream_norm
-        self.mhc_sublayer_prenorm = mhc_sublayer_prenorm
+        self.mhc_residual_expansion = mhc_residual_expansion
+        assert use_mhc in (0, 1, 2), \
+            f"use_mhc 必须 ∈ {{0,1,2}}（0=plain, 1=mHC完整版, 2=mHC无H^res版），得到 {use_mhc}"
         if self.use_mhc:
             assert isinstance(mhc_residual_expansion, int) and mhc_residual_expansion >= 1, \
                 f"mhc_residual_expansion 必须是 >=1 的整数，得到 {mhc_residual_expansion}"
@@ -141,6 +159,11 @@ def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
     return (x[:, :, :, None, :].expand(bs, slen, num_key_value_heads, n_rep, head_dim).reshape(bs, slen, num_key_value_heads * n_rep, head_dim))
 
 class Attention(nn.Module):
+    """三档自动 dispatch：flash-attn lib > PyTorch SDPA > 手写慢路径。
+    - flash-attn lib：CUDA + bf16/fp16 + 无任意 attn_mask（GQA 原生支持，省 repeat_kv 与 transpose）
+    - SDPA：覆盖训练、KV cache decode（q_len=1）、chunked prefill（1<q_len<kv_len，显式右对齐 causal mask）、padding mask（避免 D2H 同步）
+    - 慢路径：CPU 或最终兜底
+    """
     def __init__(self, config: MiniMindConfig):
         super().__init__()
         self.num_key_value_heads = config.num_attention_heads if config.num_key_value_heads is None else config.num_key_value_heads
@@ -158,7 +181,10 @@ class Attention(nn.Module):
         self.attn_dropout = nn.Dropout(config.dropout)
         self.resid_dropout = nn.Dropout(config.dropout)
         self.dropout = config.dropout
-        self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention') and config.flash_attn
+        # flash_attn=True → 启用快路径自动 dispatch（flash-attn lib > SDPA）；False → 仅慢路径
+        self.use_fast_attn      = bool(config.flash_attn)
+        self.use_flash_attn_lib = _FLASH_ATTN_LIB_AVAILABLE and self.use_fast_attn
+        self.use_sdpa           = hasattr(F, 'scaled_dot_product_attention') and self.use_fast_attn
 
     def forward(self, x, position_embeddings, past_key_value=None, use_cache=False, attention_mask=None):
         bsz, seq_len, _ = x.shape
@@ -173,15 +199,59 @@ class Attention(nn.Module):
             xk = torch.cat([past_key_value[0], xk], dim=1)
             xv = torch.cat([past_key_value[1], xv], dim=1)
         past_kv = (xk, xv) if use_cache else None
-        xq, xk, xv = (xq.transpose(1, 2), repeat_kv(xk, self.n_rep).transpose(1, 2), repeat_kv(xv, self.n_rep).transpose(1, 2))
-        if self.flash and (seq_len > 1) and (not self.is_causal or past_key_value is None) and (attention_mask is None or torch.all(attention_mask == 1)):
-            output = F.scaled_dot_product_attention(xq, xk, xv, dropout_p=self.dropout if self.training else 0.0, is_causal=self.is_causal)
+        q_len, kv_len = xq.shape[1], xk.shape[1]
+        drop_p = self.dropout if self.training else 0.0
+
+        # ── Backend 1: Dao-AILab flash-attn lib（最优）──────────────────────────
+        # 条件：CUDA + bf16/fp16 + 无 padding mask；(B,S,H,D) layout 直传；GQA 原生支持。
+        # causal=True 时 flash_attn 自动应用右对齐 mask，q_len < kv_len（KV cache decode/prefill）也正确。
+        if (self.use_flash_attn_lib
+                and xq.is_cuda
+                and xq.dtype in (torch.float16, torch.bfloat16)
+                and attention_mask is None):
+            out_4d = _flash_attn_func(xq, xk, xv, dropout_p=drop_p, causal=self.is_causal)
+            output = out_4d.reshape(bsz, q_len, -1)
+        # ── Backend 2: PyTorch SDPA（覆盖训练 / decode / prefill / padding）─────
+        elif self.use_sdpa:
+            xq_t = xq.transpose(1, 2)
+            xk_t = repeat_kv(xk, self.n_rep).transpose(1, 2)
+            xv_t = repeat_kv(xv, self.n_rep).transpose(1, 2)
+            if attention_mask is None:
+                # 无 padding：按 q_len/kv_len 选 is_causal 或建显式右对齐 causal mask
+                # PyTorch SDPA 的 is_causal=True 在 q_len != kv_len 时是 upper-left（错误语义），
+                # 故对 KV cache 场景显式构造 mask 而非依赖 is_causal flag。
+                if not self.is_causal or q_len == 1:
+                    output = F.scaled_dot_product_attention(xq_t, xk_t, xv_t, dropout_p=drop_p, is_causal=False)
+                elif q_len == kv_len:
+                    output = F.scaled_dot_product_attention(xq_t, xk_t, xv_t, dropout_p=drop_p, is_causal=True)
+                else:  # 1 < q_len < kv_len: chunked prefill，右对齐 causal
+                    offset = kv_len - q_len
+                    m = torch.full((q_len, kv_len), float("-inf"), device=xq_t.device, dtype=xq_t.dtype).triu(offset + 1)
+                    output = F.scaled_dot_product_attention(xq_t, xk_t, xv_t, attn_mask=m, dropout_p=drop_p, is_causal=False)
+            else:
+                # 有 padding mask：合并 padding mask + 右对齐 causal mask（避免 torch.all D2H 同步）
+                neg_inf = torch.finfo(xq_t.dtype).min
+                attn_mask = (1.0 - attention_mask.to(xq_t.dtype)).unsqueeze(1).unsqueeze(2) * neg_inf  # (B,1,1,kv_len)
+                if self.is_causal and q_len > 1:
+                    offset = kv_len - q_len
+                    causal_m = torch.full((q_len, kv_len), float("-inf"), device=xq_t.device, dtype=xq_t.dtype).triu(offset + 1)
+                    attn_mask = attn_mask + causal_m  # 广播为 (B,1,q_len,kv_len)
+                output = F.scaled_dot_product_attention(xq_t, xk_t, xv_t, attn_mask=attn_mask, dropout_p=drop_p, is_causal=False)
+            output = output.transpose(1, 2).reshape(bsz, q_len, -1)
+        # ── Backend 3: 手写慢路径（CPU / 无 SDPA / 兜底）──────────────────────
         else:
-            scores = (xq @ xk.transpose(-2, -1)) / math.sqrt(self.head_dim)
-            if self.is_causal: scores[:, :, :, -seq_len:] += torch.full((seq_len, seq_len), float("-inf"), device=scores.device).triu(1)
-            if attention_mask is not None: scores += (1.0 - attention_mask.unsqueeze(1).unsqueeze(2)) * -1e9
-            output = self.attn_dropout(F.softmax(scores.float(), dim=-1).type_as(xq)) @ xv
-        output = output.transpose(1, 2).reshape(bsz, seq_len, -1)
+            xq_t = xq.transpose(1, 2)
+            xk_t = repeat_kv(xk, self.n_rep).transpose(1, 2)
+            xv_t = repeat_kv(xv, self.n_rep).transpose(1, 2)
+            scores = (xq_t @ xk_t.transpose(-2, -1)) / math.sqrt(self.head_dim)
+            if self.is_causal and q_len > 1:  # q_len=1（decode）无需 causal mask
+                offset = kv_len - q_len
+                scores = scores + torch.full((q_len, kv_len), float("-inf"), device=scores.device).triu(offset + 1)
+            if attention_mask is not None:
+                scores = scores + (1.0 - attention_mask.unsqueeze(1).unsqueeze(2)) * -1e9
+            output = self.attn_dropout(F.softmax(scores.float(), dim=-1).type_as(xq_t)) @ xv_t
+            output = output.transpose(1, 2).reshape(bsz, q_len, -1)
+
         output = self.resid_dropout(self.o_proj(output))
         return output, past_kv
 
@@ -228,20 +298,10 @@ class MOEFeedForward(nn.Module):
         return y.view(batch_size, seq_len, hidden_dim)
 
 class MiniMindBlock(nn.Module):
-    """根据 config.use_mhc 决定残差结构（两种模式共用 attn_in_norm / ffn_in_norm 命名）：
+    """三档残差结构（plain / mHC 完整版 / mHC 无 H^res）。
 
-    plain (0)：标准 pre-Norm（LLaMA 风格）。残差流 = hidden_size。
-            `h = h + attn(attn_in_norm(h))`，`h = h + mlp(ffn_in_norm(h))`
-    mHC (1)：Manifold-Constrained Hyper-Connections。残差流 = n · hidden_size；
-            每个 sublayer 由 MHCConnection 完整包裹（内部计算 H^pre/post/res 并完成残差更新）。
-            sublayer F 由 config.mhc_sublayer_prenorm 控制是否含 pre-Norm：
-              True (默认 / 论文):  F(z) = sublayer(attn_in_norm(z) 或 ffn_in_norm(z))
-                                  论文 §3.2 "pre-norm Transformer 架构" + Table 3 注释
-                                  "accounting for the pre-norm with in F"。
-              False (ablation):    F(z) = sublayer(z) 直接接收 raw H^pre·x（in_norm = Identity）
-                                  对应官方 mhc_pre kernel 的 raw 输出；32 层 + bf16 下
-                                  实测会因深层信号累积爆炸而 NaN，仅用于 A-B 对照实验。
-            MHCConnection.input_rms (作用于 n·D 维) 仅用于生成 H 系数，与 sublayer 输入归一化无关。
+    mHC 路径下 sublayer F 固定 pre-Norm：F(z) = sublayer(in_norm(z))，由调用者在 F
+    闭包里加（fused kernel 把 F 视为黑盒）。
     """
     def __init__(self, layer_id: int, config: MiniMindConfig):
         super().__init__()
@@ -250,67 +310,43 @@ class MiniMindBlock(nn.Module):
         self.use_mhc = config.use_mhc
         eps = config.rms_norm_eps
         D = config.hidden_size
+        self.attn_in_norm = nn.RMSNorm(D, eps=eps)
+        self.ffn_in_norm  = nn.RMSNorm(D, eps=eps)
         if config.use_mhc:
-            n = config.mhc_residual_expansion           # hyper-connection 路数（典型 4）
-            mhc_kwargs = dict(alpha_init=config.mhc_alpha_init,
-                              sinkhorn_iters=config.mhc_sinkhorn_iters,
-                              post_mult_value=config.mhc_post_mult_value, eps=eps,
-                              disable_h_res=config.mhc_disable_h_res,
-                              per_stream_norm=config.mhc_per_stream_norm,
-                              h_pre_activation=config.mhc_h_pre_activation)
-            self.attn_mhc = MHCConnection(n, D, **mhc_kwargs)
-            self.mlp_mhc  = MHCConnection(n, D, **mhc_kwargs)
-            # sublayer F 内部 pre-Norm（论文/官方 pre-norm Transformer 默认配置）
-            # 关掉后等价于"裸 attn/mlp 接收 raw H^pre·x"，仅用于 ablation
-            self.sublayer_prenorm = config.mhc_sublayer_prenorm
-            if self.sublayer_prenorm:
-                self.attn_in_norm = nn.RMSNorm(D, eps=eps)
-                self.ffn_in_norm  = nn.RMSNorm(D, eps=eps)
-            else:
-                self.attn_in_norm = nn.Identity()
-                self.ffn_in_norm  = nn.Identity()
-        else:
-            # 原版 MiniMind pre-Norm（LLaMA 风格）：残差流 = hidden_size
-            # 用 PyTorch 2.4+ 自带 nn.RMSNorm（内部 fp32 + 融合，ckpt 兼容 `weight`）
-            self.attn_in_norm = nn.RMSNorm(D, eps=eps)
-            self.ffn_in_norm  = nn.RMSNorm(D, eps=eps)
+            n = config.mhc_residual_expansion
+            MHCConnCls = MHCConnection_Fused if config.use_mhc == 1 else MHCConnection_FusedNoHres
+            self.attn_mhc = MHCConnCls(n, D, eps=eps)
+            self.mlp_mhc  = MHCConnCls(n, D, eps=eps)
 
     def forward(self, hidden_states, position_embeddings, past_key_value=None, use_cache=False, attention_mask=None):
-        # hidden_states: (b, l, hidden_size) [plain] 或 (b, l, n·hidden_size) [mhc]
+        # hidden_states: (b, l, D) [plain] 或 (b, l, n·D) [mhc]
         if self.use_mhc:
-            # mHC 模式：把 sublayer F 包成闭包传给 MHCConnection，严格对齐论文 Eq.3：
-            #     x' = H^res · x + H^post.T · F(H^pre · x)
-            # F = attn 或 mlp，由 config.mhc_sublayer_prenorm 决定是否在内部加 RMSNorm：
-            #   True (默认/论文)  → F(z) = sublayer(in_norm(z))
-            #   False (ablation) → F(z) = sublayer(z)   ← attn_in_norm/ffn_in_norm = Identity
+            # 把 sublayer F 包成闭包传给 MHCConnection（论文 Eq.3：x' = H^res·x + H^post·F(H^pre·x)）
             # attn 的 past_kv 是状态副作用，用闭包变量捕获。
             present_kv_holder = [None]
 
-            def attn_fn(z):  # z: (b, l, D) → (b, l, D)；z = H^pre · x
+            def attn_fn(z):
                 out, present_kv = self.self_attn(
                     self.attn_in_norm(z), position_embeddings, past_key_value, use_cache, attention_mask
                 )
                 present_kv_holder[0] = present_kv
                 return out
 
-            def mlp_fn(z):   # z: (b, l, D) → (b, l, D)；z = H^pre · x
+            def mlp_fn(z):
                 return self.mlp(self.ffn_in_norm(z))
 
             hidden_states = self.attn_mhc(hidden_states, attn_fn)
             hidden_states = self.mlp_mhc(hidden_states, mlp_fn)
             return hidden_states, present_kv_holder[0]
 
-        # ===== plain: 标准 pre-Norm "residual + sublayer(in_norm(residual))" =====
-        # ----- Self-Attention 子层 -----
+        # plain pre-Norm
         residual = hidden_states
         attn_out, present_key_value = self.self_attn(
             self.attn_in_norm(hidden_states), position_embeddings, past_key_value, use_cache, attention_mask
-        )  # (b, l, hidden_size)
+        )
         hidden_states = residual + attn_out
-        # ----- FFN 子层 -----
         residual = hidden_states
-        ffn_out = self.mlp(self.ffn_in_norm(hidden_states))  # (b, l, hidden_size)
-        hidden_states = residual + ffn_out
+        hidden_states = residual + self.mlp(self.ffn_in_norm(hidden_states))
         return hidden_states, present_key_value
 
 
@@ -324,20 +360,15 @@ class MiniMindModel(nn.Module):
         eps = config.rms_norm_eps
         D = config.hidden_size
         if config.use_mhc:
-            n = config.mhc_residual_expansion       # hyper-connection 路数
-            # entry: embed(D) → RMSNorm → 对称复制到 n 路残差流 (n·D)
-            #        （StreamExpand 无参数，对齐 DeepSeek 官方 expand_to_mhc_ref）
-            # exit : 残差流 (n·D) → MHCHead 可学加权 reduce → RMSNorm → lm_head
-            #        （MHCHead 替代旧版无参 StreamReduce，解决"最后一层 H_res frozen"死锁；
-            #         对齐官方 mhc_head 的 sigmoid·x sum 结构）
+            n = config.mhc_residual_expansion
+            # entry: RMSNorm + StreamExpand (D → n·D)；exit: MHCHead (n·D → D) + RMSNorm
             self.embed_up_norm = nn.Sequential(nn.RMSNorm(D, eps=eps), StreamExpand(n, D))
             self.layers = nn.ModuleList([MiniMindBlock(l, config) for l in range(self.num_hidden_layers)])
             self.norm = nn.Sequential(
-                MHCHead(n, D, alpha_init=config.mhc_alpha_init, eps=eps),
+                MHCHead(n, D, eps=eps),
                 nn.RMSNorm(D, eps=eps),
             )
         else:
-            # 原版 MiniMind：残差流就是 hidden_size，无需 embed 后升维；final 用 torch.nn.RMSNorm
             self.embed_up_norm = nn.Identity()
             self.layers = nn.ModuleList([MiniMindBlock(l, config) for l in range(self.num_hidden_layers)])
             self.norm = nn.RMSNorm(D, eps=eps)
@@ -350,8 +381,8 @@ class MiniMindModel(nn.Module):
         if hasattr(past_key_values, 'layers'): past_key_values = None
         past_key_values = past_key_values or [None] * len(self.layers)
         start_pos = past_key_values[0][0].shape[1] if past_key_values[0] is not None else 0
-        hidden_states = self.dropout(self.embed_tokens(input_ids))  # (b, l, hidden_size)
-        hidden_states = self.embed_up_norm(hidden_states)  # (b, l, n*hidden_size) 进入残差流（mHC）或恒等（plain）
+        hidden_states = self.dropout(self.embed_tokens(input_ids))  # (b, l, D)
+        hidden_states = self.embed_up_norm(hidden_states)           # (b, l, n·D) [mhc] 或恒等 [plain]
         # Recompute RoPE buffers lost during meta-device init (transformers>=5.x)
         if self.freqs_cos[0, 0] == 0:
             freqs_cos, freqs_sin = precompute_freqs_cis(dim=self.config.head_dim, end=self.config.max_position_embeddings, rope_base=self.config.rope_theta, rope_scaling=self.config.rope_scaling)
@@ -367,7 +398,7 @@ class MiniMindModel(nn.Module):
                 attention_mask=attention_mask
             )
             presents.append(present)
-        hidden_states = self.norm(hidden_states)  # (b, l, hidden_size) 降回 lm_head 维度
+        hidden_states = self.norm(hidden_states)  # (b, l, D)
         aux_loss = sum([l.mlp.aux_loss for l in self.layers if isinstance(l.mlp, MOEFeedForward)], hidden_states.new_zeros(1).squeeze())
         return hidden_states, presents, aux_loss
 
@@ -381,6 +412,8 @@ class MiniMindForCausalLM(PreTrainedModel, GenerationMixin):
         self.lm_head = nn.Linear(self.config.hidden_size, self.config.vocab_size, bias=False)
         if self.config.tie_word_embeddings: self.model.embed_tokens.weight = self.lm_head.weight
         self.post_init()
+        # rank0 进程首次构建模型时打印 flash-attn 版本，提示 H800 是否启用 v3 优化路径
+        _log_flash_attn_status_once()
 
     def forward(self, input_ids, attention_mask=None, past_key_values=None, use_cache=False, logits_to_keep=0, labels=None, **kwargs):
         hidden_states, past_key_values, aux_loss = self.model(input_ids, attention_mask, past_key_values, use_cache, **kwargs)

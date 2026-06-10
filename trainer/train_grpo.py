@@ -219,11 +219,8 @@ if __name__ == "__main__":
     parser.add_argument("--save_interval", type=int, default=10, help="模型保存间隔")
     parser.add_argument('--hidden_size', default=768, type=int, help="隐藏层维度")
     parser.add_argument('--num_hidden_layers', default=8, type=int, help="隐藏层数量")
-    parser.add_argument('--use_mhc', default=0, type=int, choices=[0, 1], help="是否启用 mHC（Manifold-Constrained Hyper-Connections, DeepSeek 2025 arXiv:2512.24880）；残差流路数 n = mhc_residual_expansion")
-    parser.add_argument('--mhc_residual_expansion', default=4, type=int, help="残差扩张倍数（use_mhc=1 时生效）；残差流维度 = hidden_size * mhc_residual_expansion，常用 2/4/8")
-    parser.add_argument('--mhc_disable_h_res', default=0, type=int, choices=[0, 1], help="Ablation：是否禁用 mHC 的 H^res 投影（use_mhc=1 时生效）。1=每层 H^res 冻结为 identity matrix，跳过 Sinkhorn-Knopp，切断 n 路残差流之间的信息混合（对应论文 Table 1 H^res 禁用对照）")
-    parser.add_argument('--mhc_per_stream_norm', default=0, type=int, choices=[0, 1], help="Ablation：MHCConnection.input_rms 是否改为 per-stream RMSNorm（use_mhc=1 时生效）。0=RMSNorm(n·D) 整体归一化（论文/官方标准，保留 inter-stream 相对量级）；1=PerStreamRMSNorm(n,D) 每路独立归一化（每路独立 weight, 参数量 n·D 与 0 一致, 破坏 inter-stream signal 的 strictly controlled 对照组）")
-    parser.add_argument('--mhc_h_pre_activation', default='sigmoid', type=str, choices=['sigmoid', 'softmax', 'identity', 'relu', 'tanh'], help="Ablation：H^pre 的激活函数（use_mhc=1 时生效）。sigmoid（默认，论文/官方）: σ(raw)+ε ∈ (ε, 1+ε) 每路独立非负有界；softmax: n 路 normalized mixture (Σ=1)；identity: 无激活 raw mix (可正可负)；relu: 稀疏激活 [ε, ∞)；tanh: (-1, 1) 允许负 mix")
+    parser.add_argument('--use_mhc', default=0, type=int, choices=[0, 1, 2], help="mHC（Manifold-Constrained Hyper-Connections, DeepSeek 2025 arXiv:2512.24880）三档：0=不启用（plain LLaMA pre-Norm）；1=完整 mHC（含 H^res Sinkhorn-Knopp 投影，MHCConnection_Fused）；2=mHC 无 H^res 版（H^res 冻结为 I_n，跳过 SK，更省算子/更快，MHCConnection_FusedNoHres）；残差流路数 n = mhc_residual_expansion")
+    parser.add_argument('--mhc_residual_expansion', default=4, type=int, help="残差扩张倍数（use_mhc∈{1,2} 时生效）；残差流维度 = hidden_size * mhc_residual_expansion，常用 2/4/8；fused kernel 要求 n ∈ {1,2,4,8,16}（2 的幂），且 n·hidden_size 是 2 的幂")
     parser.add_argument('--use_moe', default=0, type=int, choices=[0, 1], help="是否使用MoE架构（0=否，1=是）")
     parser.add_argument('--max_seq_len', default=768, type=int, help="Prompt最大长度")
     parser.add_argument("--max_gen_len", type=int, default=1024, help="生成的最大长度")
@@ -257,11 +254,8 @@ if __name__ == "__main__":
     # ========== 2. 配置目录、模型参数、检查ckp ==========
     os.makedirs(args.save_dir, exist_ok=True)
     lm_config = MiniMindConfig(hidden_size=args.hidden_size, num_hidden_layers=args.num_hidden_layers,
-                               use_mhc=bool(args.use_mhc),
+                               use_mhc=args.use_mhc,
                                mhc_residual_expansion=args.mhc_residual_expansion,
-                               mhc_disable_h_res=bool(args.mhc_disable_h_res),
-                               mhc_per_stream_norm=bool(args.mhc_per_stream_norm),
-                               mhc_h_pre_activation=args.mhc_h_pre_activation,
                                max_seq_len=args.max_seq_len + args.max_gen_len, use_moe=bool(args.use_moe))
     ckp_data = lm_checkpoint(lm_config, weight=args.save_weight, save_dir='../checkpoints') if args.from_resume==1 else None
     
